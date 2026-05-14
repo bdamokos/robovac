@@ -62,6 +62,7 @@ from cryptography.hazmat.primitives import hmac as crypto_hmac
 INITIAL_BACKOFF = 5
 INITIAL_QUEUE_TIME = 0.1
 BACKOFF_MULTIPLIER = 1.70224
+DPS_BOOTSTRAP_REQUEST_LIMIT = 3
 _LOGGER = logging.getLogger(__name__)
 MESSAGE_PREFIX_FORMAT = ">IIII"
 MESSAGE_SUFFIX_FORMAT = ">II"
@@ -80,6 +81,17 @@ MESSAGE_SUFFIX_FORMAT_35 = ">16sI"  # 16-byte GCM tag + 4-byte suffix
 # v3.4+/v3.5 prepend a version header to the plaintext before encryption,
 # except for commands in NO_PROTOCOL_HEADER_CMDS.
 PROTOCOL_35_VERSION_HEADER = b"3.5" + b"\x00" * 12  # 15 bytes
+BOOTSTRAP_STATE_COMMANDS = (
+    RobovacCommand.MODE,
+    RobovacCommand.STATUS,
+    RobovacCommand.RETURN_HOME,
+    RobovacCommand.WORK_STATUS_V2,
+)
+BOOTSTRAP_DPS_COMMANDS = BOOTSTRAP_STATE_COMMANDS + (
+    RobovacCommand.BATTERY,
+    RobovacCommand.ERROR,
+    RobovacCommand.ACTIVE_ERRORS,
+)
 
 
 class TuyaException(Exception):
@@ -873,6 +885,7 @@ class TuyaDevice:
         self._backoff = False
         self._queue_interval = INITIAL_QUEUE_TIME
         self._failures = 0
+        self._dps_bootstrap_requests = 0
 
         asyncio.create_task(self.process_queue())
 
@@ -1171,19 +1184,36 @@ class TuyaDevice:
         if self.reader is not None and not self.reader.at_eof():
             self.reader.feed_eof()
 
-    def _dps_to_request(self) -> dict[str, None]:
-        """Build a DPS map for device22-style status queries.
+    def _dps_codes_for_commands(
+        self, commands: tuple[RobovacCommand, ...]
+    ) -> set[str]:
+        """Return model DPS codes for the given command names."""
+        dps_ids = set()
+        for command in commands:
+            command_details = self.model_details.commands.get(command)
+            if isinstance(command_details, dict):
+                code = command_details.get("code")
+                if code is not None:
+                    dps_ids.add(str(code))
+        return dps_ids
 
-        Returns a dict with known DPS keys mapped to None.  If we already
-        have cached state, use those keys; otherwise request common DPS
-        codes for the device model.
+    def _dps_to_request(self) -> dict[str, None]:
+        """Build a bootstrap DPS map for v3.4+ status refreshes.
+
+        Returns a dict with model-defined state DPS keys mapped to None. This
+        intentionally avoids requesting every known model DPS on each startup
+        recovery attempt.
         """
-        if self._dps:
-            return {k: None for k in self._dps}
-        # Request common DPS codes that T2276 and similar vacuums use.
-        # This is better than requesting DPS 1 which doesn't exist on
-        # most vacuum models.
-        return {str(k): None for k in [2, 5, 15, 101, 102, 103, 104, 106]}
+        dps_ids = self._dps_codes_for_commands(BOOTSTRAP_DPS_COMMANDS)
+        return {dps_id: None for dps_id in sorted(dps_ids, key=int)}
+
+    def _needs_bootstrap_dps_update(self) -> bool:
+        """Return true while v3.4+ devices have not reported usable state."""
+        if self._dps_bootstrap_requests >= DPS_BOOTSTRAP_REQUEST_LIMIT:
+            return False
+
+        state_dps_ids = self._dps_codes_for_commands(BOOTSTRAP_STATE_COMMANDS)
+        return bool(state_dps_ids) and not any(dps_id in self._dps for dps_id in state_dps_ids)
 
     async def async_get(self) -> None:
         """Get the current state of the device.
@@ -1191,15 +1221,13 @@ class TuyaDevice:
         This method retrieves the current state of the device.
         """
         if self.version >= (3, 4):
-            # v3.5 devices reject all known GET/query commands:
-            # - DP_QUERY (0x0a) → "json obj data unvalid"
-            # - DP_QUERY_NEW (0x10) → same
-            # - UPDATEDPS (0x12) → empty ACK, no DPS data (tested with
-            #   valid DPS IDs [2,5,15,101,102,103,104,106] — still empty)
-            #
-            # The only way to get DPS state is via gratuitous updates (0x08)
-            # the device sends after SET commands.  So just stay connected.
+            # DP_QUERY/DP_QUERY_NEW are unreliable on v3.4+ devices. During
+            # startup recovery, ask for the model's state DPS a few times; once
+            # a state DPS has been seen, normal gratuitous updates take over.
             await self.async_connect()
+            if self._needs_bootstrap_dps_update():
+                self._dps_bootstrap_requests += 1
+                await self._async_request_dps_update()
             return
         payload_dict = {"gwId": self.gateway_id, "devId": self.device_id}
         payload_bytes = json.dumps(payload_dict).encode("utf-8")
